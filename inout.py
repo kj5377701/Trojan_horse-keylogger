@@ -1,13 +1,22 @@
+# this doc response for input and output
 import socket
 import struct
 import io
+from common import *
 
 
-class INOUT():
+class InOutException(Exception):
+    pass
+
+
+class INOUT:
     def __init__(self, handle):
         self.handle = handle
+        self.exceptTag = b'\\'
 
-    def data_to_nbyte(self, n):
+    def data_to_nbyte(self, n, exceptFlag=False):
+        exceptTag = {False: b'', True: self.exceptTag}.get(exceptFlag, b'')
+
         if isinstance(n, int):
             if n < (1 << 8):
                 tag = 'B'
@@ -15,22 +24,45 @@ class INOUT():
                 tag = 'H'
             elif n < (1 << 32):
                 tag = 'L'
-            else:
+            elif n < (1 << 64):
                 tag = 'Q'
-            n = struct.pack('!' + tag, n)
-            return tag.encode('utf-8') + n
+            else:
+                tag = 'U'
+            if tag != 'U':
+                n = struct.pack("!" + tag, n)
+                nbyte = tag.encode('utf-8') + n
+            else:
+                b = bignum_to_bytes(n)
+                nbyte = tag.encode('utf-8') + self.data_to_nbyte(len(b)) + b
         elif isinstance(n, str):
             tag = 'c'
             n = n.encode('utf-8')
-            return tag.encode('utf-8') + self.data_to_nbyte(len(n)) + n
+            nbyte = tag.encode('utf-8') + self.data_to_nbyte(len(n)) + n
         elif isinstance(n, bytes):
             tag = 's'
-            return tag.encode('utf-8') + self.data_to_nbyte(len(n)) + n
-        raise TypeError('invalid type: ' + type(n))
+            nbyte = tag.encode('utf-8') + self.data_to_nbyte(len(n)) + n
+        if exceptTag:
+            logging.debug('send exception: %s' % str(nbyte))
+        return exceptTag + nbyte
 
     def nbyte_to_data(self):
         size_info = {'B': 1, 'H': 2, 'L': 4, 'Q': 8}
+
+        valendata = {
+            's': lambda n: n,
+            'c': lambda n: n.decode('utf-8'),
+            'U': lambda n: bytes_to_bignum(n)
+        }
+
         btag = self.read_raw(1)
+
+        if not btag:
+            return None
+
+        exceptFlag = False
+
+        if btag == self.exceptTag:
+            btag = self.read_raw(1)
 
         if not btag:
             return None
@@ -39,9 +71,11 @@ class INOUT():
 
         if tag in size_info:
             size = size_info[tag]
-            bnum = self.read_raw(size)
+            bnum = b''
+            while len(bnum) < size:
+                bnum += self.read_raw(size - len(bnum))
             result = struct.unpack('!' + tag, bnum)[0]
-        elif tag in ['s', 'c']:
+        elif tag in valendata:
             size = self.nbyte_to_data()
             if size >= 65536:
                 raise ValueError('length too long')
@@ -49,15 +83,26 @@ class INOUT():
             bstr = b''
             while len(bstr) < size:
                 bstr += self.read_raw(size - len(bstr))
-            result = bstr if tag == 's' else bstr.decode('utf-8')
+            result = valendata[tag](bstr)
+        else:
+            raise TypeError('nbyte_to_data: invalid type: ' + tag)
+        if exceptFlag:
+            logging.debug('recv exception: %s' % result)
+            raise InOutException(result)
         return result
 
     def read(self):
         return self.nbyte_to_data()
 
-    def write(self, d):
-        byte_data = self.data_to_nbyte(d)
+    def write(self, d, exceptFlag=False):
+        byte_data = self.data_to_nbyte(exceptFlag)
         self.write_raw(byte_data)
+
+    def read_raw(self, n):
+        return self.read_handle(n)
+
+    def write_raw(self, d):
+        return self.write_handle(d)
 
     def close(self):
         return self.close_handle()
@@ -69,22 +114,28 @@ class INOUT():
         print(d)
         return len(d)
 
-    def read_raw(self, n):
-        return self.read_handle(n)
-
-    def write_raw(self, d):
-        return self.write(d)
-
     def close_handle(self):
         return self.handle
 
 
 class NetworkIO(INOUT):
     def read_handle(self, n):
-        return self.handle.recv(n)
+        try:
+            return self.handle.recv(n)
+        except Exception as e:
+            logging.debug('Exception: %s' % str(e))
+            raise
 
     def write_handle(self, d):
-        return self.handle.send(d)
+        try:
+            return self.handle.send(d)
+        except Exception as e:
+            logging.debug('Expection: %s' % str(e))
+            raise
+
+    def close_handle(self):
+        # this code i not very sure about
+        return self.handle.close()
 
 
 class FileIO(INOUT):
@@ -111,3 +162,26 @@ def InitIO(handle):
         socket.socket: NetworkIO
     }
     return readers.get(type(handle), None)(handle)
+
+
+def bignum_to_bytes(num):
+    result = b''
+    while num > 0:
+        b = num % 128
+        num >>= 7
+        if num:
+            b += 128
+        result += bytes([b])
+    return result
+
+
+def bytes_to_bignum(source):
+    result = 0
+    exp = 0
+    for b in source:
+        n = b % 128
+        result += n << exp
+        exp += 7
+        if b & (1 << 7) == 0:
+            break
+    return result
